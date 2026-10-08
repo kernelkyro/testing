@@ -1,11 +1,11 @@
 --[[
-    Roblox Client Script — Fly / Teleport / Bring
-    Executor context (Synapse, Krnl, Fluxus, Solara, etc.)
-    Loadstring-ready.
+    Roblox Client Script — Fly / Teleport / Bring / Grab
+    Executor context.
     
     Fly: toggle via GUI or RightShift
     Teleport To: moves YOUR character to selected player
-    Bring: attempts to move TARGET player to you (fires teleport remotes)
+    Bring: fires teleport remotes on target
+    Grab: welds selected player's character to yours and drags them
 ]]
 
 local Players = game:GetService("Players")
@@ -21,6 +21,13 @@ local flyConnection = nil
 local bodyVelocity = nil
 local bodyGyro = nil
 local selectedPlayer = nil
+
+-- grab state
+local grabbing = false
+local grabConnection = nil
+local grabWeld = nil
+local grabAlign = nil
+local grabTargetHrp = nil
 
 -- ============ GUI ============
 local screenGui = Instance.new("ScreenGui")
@@ -44,7 +51,7 @@ if not parented then
 end
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 240, 0, 320)
+mainFrame.Size = UDim2.new(0, 240, 0, 380)
 mainFrame.Position = UDim2.new(0, 20, 0, 100)
 mainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
 mainFrame.BorderSizePixel = 0
@@ -60,7 +67,7 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, 0, 0, 30)
 title.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
 title.BorderSizePixel = 0
-title.Text = "fly / tp"
+title.Text = "fly / tp / grab"
 title.TextColor3 = Color3.fromRGB(220, 220, 230)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 14
@@ -173,6 +180,21 @@ local bringCorner = Instance.new("UICorner")
 bringCorner.CornerRadius = UDim.new(0, 6)
 bringCorner.Parent = bringBtn
 
+local grabBtn = Instance.new("TextButton")
+grabBtn.Size = UDim2.new(0.9, 0, 0, 32)
+grabBtn.Position = UDim2.new(0.05, 0, 0, 320)
+grabBtn.BackgroundColor3 = Color3.fromRGB(60, 110, 90)
+grabBtn.BorderSizePixel = 0
+grabBtn.Text = "Grab: OFF"
+grabBtn.TextColor3 = Color3.fromRGB(240, 240, 245)
+grabBtn.Font = Enum.Font.GothamBold
+grabBtn.TextSize = 13
+grabBtn.Parent = mainFrame
+
+local grabCorner = Instance.new("UICorner")
+grabCorner.CornerRadius = UDim.new(0, 6)
+grabCorner.Parent = grabBtn
+
 -- ============ PLAYER LIST BUILD ============
 local function rebuildList()
     for _, child in ipairs(playerList:GetChildren()) do
@@ -214,6 +236,11 @@ rebuildList()
 Players.PlayerAdded:Connect(rebuildList)
 Players.PlayerRemoving:Connect(function(p)
     if selectedPlayer == p then selectedPlayer = nil end
+    if grabbing and grabTargetHrp and grabTargetHrp.Parent == nil then
+        -- target left while grabbed
+        grabbing = false
+        grabBtn.Text = "Grab: OFF"
+    end
     task.wait(0.1)
     rebuildList()
 end)
@@ -351,4 +378,119 @@ bringBtn.MouseButton1Click:Connect(function()
             pcall(function() remote:FireServer("tp", selectedPlayer, myPos) end)
         end
     end
+end)
+
+-- ============ GRAB / CARRY ============
+-- welds target player's HRP to yours with a fixed offset in front of you.
+-- they get dragged around with your movement.
+-- releases cleanly on toggle off or target death.
+
+local function releaseGrab()
+    grabbing = false
+    grabBtn.Text = "Grab: OFF"
+    grabBtn.BackgroundColor3 = Color3.fromRGB(60, 110, 90)
+    
+    if grabConnection then grabConnection:Disconnect() grabConnection = nil end
+    if grabWeld then grabWeld:Destroy() grabWeld = nil end
+    if grabAlign then grabAlign:Destroy() grabAlign = nil end
+    
+    if grabTargetHrp and grabTargetHrp.Parent then
+        local hum = grabTargetHrp.Parent:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.PlatformStand = false
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end
+    end
+    
+    grabTargetHrp = nil
+end
+
+local function startGrab()
+    if not selectedPlayer then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local myHrp = char:FindFirstChild("HumanoidRootPart")
+    if not myHrp then return end
+    
+    local targetChar = selectedPlayer.Character
+    if not targetChar then return end
+    local targetHrp = targetChar:FindFirstChild("HumanoidRootPart")
+    if not targetHrp then return end
+    local targetHum = targetChar:FindFirstChildOfClass("Humanoid")
+    
+    grabbing = true
+    grabBtn.Text = "Grab: ON"
+    grabBtn.BackgroundColor3 = Color3.fromRGB(60, 160, 110)
+    grabTargetHrp = targetHrp
+    
+    -- stop them from flailing / walking against the weld
+    if targetHum then
+        targetHum.PlatformStand = true
+        targetHum:ChangeState(Enum.HumanoidStateType.Physics)
+    end
+    
+    -- AlignPosition for smooth follow (feels better than raw weld on FE games)
+    local attachMine = Instance.new("Attachment")
+    attachMine.Name = "GrabAttachMine"
+    attachMine.Parent = myHrp
+    
+    local attachTheirs = Instance.new("Attachment")
+    attachTheirs.Name = "GrabAttachTheirs"
+    attachTheirs.Parent = targetHrp
+    
+    grabAlign = Instance.new("AlignPosition")
+    grabAlign.Attachment0 = attachMine
+    grabAlign.Attachment1 = attachTheirs
+    grabAlign.MaxForce = 1e6
+    grabAlign.Responsiveness = 25
+    grabAlign.Position = Vector3.new(0, 0, -3)  -- 3 studs in front of you
+    grabAlign.Parent = myHrp
+    
+    -- AlignOrientation so they face same direction as you
+    local orientMine = Instance.new("Attachment")
+    orientMine.Name = "GrabOrientMine"
+    orientMine.Parent = myHrp
+    
+    local orientTheirs = Instance.new("Attachment")
+    orientTheirs.Name = "GrabOrientTheirs"
+    orientTheirs.Parent = targetHrp
+    
+    grabAlign = grabAlign -- keep align ref
+    local alignOrient = Instance.new("AlignOrientation")
+    alignOrient.Attachment0 = orientMine
+    alignOrient.Attachment1 = orientTheirs
+    alignOrient.MaxTorque = 1e6
+    alignOrient.Responsiveness = 25
+    alignOrient.Parent = myHrp
+    
+    -- keep them in a stunned state while grabbed
+    grabConnection = RunService.Heartbeat:Connect(function()
+        if not grabbing then return end
+        if not grabTargetHrp or not grabTargetHrp.Parent then
+            releaseGrab()
+            return
+        end
+        local hum = grabTargetHrp.Parent:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health <= 0 then
+            releaseGrab()
+            return
+        end
+        -- keep them in physics so they don't fight the align
+        if hum then
+            hum.PlatformStand = true
+        end
+    end)
+end
+
+grabBtn.MouseButton1Click:Connect(function()
+    if grabbing then
+        releaseGrab()
+    else
+        startGrab()
+    end
+end)
+
+-- release grab on death / respawn
+LocalPlayer.CharacterAdded:Connect(function()
+    if grabbing then releaseGrab() end
 end)
